@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────
-#  Service Topology Manager — One-Command Demo
+#  JaegerViz — One-Command Demo
 # ──────────────────────────────────────────────────────
 #  Spins up a local Jaeger, sends real traces into it,
 #  builds the topology graph, and opens it in your browser.

@@ -71,7 +71,7 @@ def _fetch_traces(
 @click.group()
 @click.version_option(version="1.0.0")
 def cli():
-    """Service Topology Manager — trace-based microservice dependency graph visualizer."""
+    """JaegerViz — trace-based microservice dependency graph visualizer."""
     pass
 
 

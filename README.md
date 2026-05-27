@@ -1,4 +1,4 @@
-# Service Topology Manager
+# JaegerViz
 
 > **What is this?** A tool that draws a map of your microservices — showing who talks to whom, how often, and whether anything looks broken. Think of it as Google Maps for your backend architecture.
 
@@ -37,7 +37,7 @@ You can get up and running in **under 30 seconds**. Pick your path:
 ### Before anything: install
 
 ```bash
-cd "/Users/ramster/service topology manager"
+cd JaegerViz
 pip install -e .
 ```
 
@@ -545,7 +545,7 @@ flowchart LR
 ### File map
 
 ```
-service-topology-manager/
+JaegerViz/
 │
 ├── src/
 │   ├── models/
