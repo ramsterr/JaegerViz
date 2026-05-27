@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Service Topology Manager — Microservice Dependency Graph Visualizer</title>
+<meta name="description" content="Open-source tool that fetches traces from Jaeger, builds a directed weighted service call graph, flags anomalous services, and exports per-edge lag windows for root-cause analysis.">
+<meta property="og:title" content="Service Topology Manager">
+<meta property="og:description" content="Trace-based microservice dependency graph visualizer.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#ff8c00">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" rel="stylesheet">
+
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+html { scroll-behavior:smooth; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; }
+
+:root {
+  --bg:        #0a0a0f;
+  --bg-surface:#13131a;
+  --bg-card:   #16161f;
+  --bg-code:   #0d0d15;
+  --border:    #1c1c2a;
+  --border-h:  #2d2d40;
+  --accent:    #ff8c00;
+  --accent-m:  rgba(255,140,0,0.12);
+  --accent-bg: rgba(255,140,0,0.06);
+  --t-primary: #f0f0f5;
+  --t-secondary: #9090a0;
+  --t-tertiary: #5c5c70;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--t-secondary);
+  line-height: 1.6;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+::selection { background: var(--accent); color: #000; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+a { color: inherit; text-decoration: none; }
+
+/* ─── Navigation ─── */
+.nav {
+  position: fixed; top:0; left:0; right:0; z-index:1000;
+  height: 60px; padding: 0 40px;
+  display: flex; align-items: center; justify-content: space-between;
+  background: rgba(10,10,15,0.82);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  border-bottom: 1px solid var(--border);
+}
+.nav-brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:16px; color:var(--t-primary); letter-spacing:-0.02em; }
+.nav-brand .marker { width:8px; height:8px; border-radius:2px; background:var(--accent); }
+.nav-brand .vers { color:var(--t-tertiary); font-weight:400; font-size:13px; margin-left:6px; }
+.nav-r { display:flex; align-items:center; gap:28px; }
+.nav-r a { font-size:14px; font-weight:500; color:var(--t-secondary); transition:color 0.15s; }
+.nav-r a:hover { color:var(--t-primary); }
+
+/* ─── Buttons ─── */
+.btn {
+  display:inline-flex; align-items:center; gap:7px; padding:9px 18px;
+  border-radius:6px; font-size:14px; font-weight:600; cursor:pointer;
+  transition: all 0.15s; border:1px solid transparent;
+  font-family:inherit; letter-spacing:-0.01em; white-space:nowrap;
+}
+.btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.btn-p { background:var(--accent); color:#000; }
+.btn-p:hover { background:#ff9d20; }
+.btn-s { border-color:var(--border-h); color:var(--t-primary); }
+.btn-s:hover { border-color:#555; background:var(--bg-surface); }
+.btn-ghost { color:var(--t-secondary); border-color:transparent; }
+.btn-ghost:hover { color:var(--t-primary); background:var(--bg-surface); }
+.btn svg { flex-shrink:0; width:14px; height:14px; }
+
+/* ─── Sidebar ─── */
+.sidebar {
+  position:fixed; top:60px; right:0; bottom:0; width:0;
+  background:var(--bg-card); border-left:1px solid var(--border);
+  transition:width 0.25s ease; overflow:hidden; z-index:999;
+  display:flex; flex-direction:column;
+}
+.sidebar.open { width:340px; min-width:340px; }
+.sidebar-hd {
+  padding:16px 20px; background:var(--bg-surface);
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between;
+  min-width:340px;
+}
+.sidebar-hd h2 { font-size:14px; font-weight:700; color:var(--accent); text-transform:uppercase; letter-spacing:0.06em; }
+.sidebar-close {
+  background:none; border:1px solid var(--border-h); color:var(--t-secondary);
+  width:26px; height:26px; border-radius:5px; cursor:pointer; font-size:14px;
+  transition:all 0.15s; display:flex; align-items:center; justify-content:center;
+}
+.sidebar-close:hover { background:var(--accent); color:#000; border-color:var(--accent); }
+.sidebar-body { flex:1; overflow-y:auto; padding:18px 20px; min-width:340px; }
+.sb-sec { margin-bottom:22px; }
+.sb-sec-t { font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:var(--t-tertiary); margin-bottom:10px; padding-bottom:6px; border-bottom:1px solid var(--border); font-weight:600; }
+.sb-row { display:flex; justify-content:space-between; padding:5px 0; font-size:13px; border-bottom:1px solid rgba(255,255,255,0.03); }
+.sb-row .l { color:var(--t-tertiary); }
+.sb-row .v { color:var(--t-primary); font-weight:600; text-align:right; }
+.sb-badge { display:inline-block; padding:2px 10px; border-radius:10px; font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }
+.sb-badge.ok { background:rgba(16,185,129,0.15); color:#10B981; }
+.sb-badge.warn { background:rgba(245,158,11,0.15); color:#F59E0B; }
+.sb-badge.bad { background:rgba(239,68,68,0.15); color:#EF4444; }
+.sb-chips { display:flex; flex-wrap:wrap; gap:6px; list-style:none; }
+.sb-chips li { background:#1c1c28; border:1px solid var(--border); padding:3px 10px; border-radius:5px; font-size:12px; cursor:pointer; transition:all 0.15s; color:var(--t-secondary); }
+.sb-chips li:hover { background:var(--accent); color:#000; border-color:var(--accent); }
+
+/* ─── Search ─── */
+.search-box {
+  position:absolute; top:12px; left:12px; z-index:10;
+  background:var(--bg-card); border:1px solid var(--border); border-radius:7px;
+  padding:6px 14px; display:flex; align-items:center; gap:6px;
+  transition:border-color 0.2s; min-width:180px;
+}
+.search-box:focus-within { border-color:var(--accent); }
+.search-box input { background:none; border:none; outline:none; color:var(--t-primary); font-size:13px; width:140px; font-family:inherit; }
+.search-box input::placeholder { color:var(--t-tertiary); }
+.search-box svg { color:var(--t-tertiary); flex-shrink:0; }
+
+/* ─── Hero ─── */
+.hero {
+  padding: 140px 40px 90px; text-align:center;
+  position:relative; overflow:hidden;
+}
+.hero::before {
+  content:''; position:absolute; inset:0;
+  background:
+    radial-gradient(ellipse 60% 50% at 50% 0%, rgba(255,140,0,0.07) 0%, transparent 60%),
+    radial-gradient(ellipse 30% 40% at 80% 60%, rgba(255,120,0,0.04) 0%, transparent 50%);
+  pointer-events:none;
+}
+.hero .pill {
+  display:inline-flex; align-items:center; gap:6px;
+  padding:3px 14px; border-radius:20px; margin-bottom:28px;
+  background:var(--accent-bg); border:1px solid rgba(255,140,0,0.18);
+  font-size:13px; font-weight:500; color:var(--accent); letter-spacing:0.02em;
+}
+.hero .pill .dot { width:5px; height:5px; border-radius:50%; background:var(--accent); }
+.hero h1 {
+  font-size:clamp(40px,6vw,64px); font-weight:800; line-height:1.08;
+  color:var(--t-primary); letter-spacing:-0.03em; margin-bottom:20px;
+  max-width:720px; margin-left:auto; margin-right:auto;
+}
+.hero h1 em { font-style:normal; color:var(--accent); }
+.hero > p {
+  font-size:17px; color:var(--t-secondary); max-width:520px;
+  margin:0 auto 38px; line-height:1.7;
+}
+.hero-btns { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+
+/* ─── Sections ─── */
+.sec { padding: 120px 40px; max-width:1160px; margin:0 auto; }
+.sec-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.1em; color:var(--accent); margin-bottom:14px; }
+.sec h2 { font-size:clamp(26px,3.5vw,34px); font-weight:700; color:var(--t-primary); letter-spacing:-0.02em; margin-bottom:14px; }
+.sec > .sub { color:var(--t-secondary); font-size:16px; max-width:540px; margin-bottom:56px; line-height:1.65; }
+
+/* ─── Feature cards ─── */
+.grid-3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:16px; }
+.card {
+  background:var(--bg-card); border:1px solid var(--border); border-radius:10px;
+  padding:32px; transition:border-color 0.2s, background 0.2s;
+}
+.card:hover { border-color:var(--border-h); background:var(--bg-surface); }
+.card h3 { font-size:16px; font-weight:700; color:var(--t-primary); margin-bottom:8px; letter-spacing:-0.02em; }
+.card p { font-size:14px; color:var(--t-secondary); line-height:1.65; }
+.card code { background:var(--bg-code); padding:1px 6px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--accent); border:1px solid var(--border); }
+.card .icon { width:36px; height:36px; border-radius:7px; background:var(--accent-bg); border:1px solid rgba(255,140,0,0.1); display:flex; align-items:center; justify-content:center; margin-bottom:18px; color:var(--accent); font-size:18px; }
+
+/* ─── Graph section ─── */
+.graph-wrap { background:var(--bg-surface); border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
+#graph { width:100%; height:520px; background:var(--bg-card); border:1px solid var(--border); border-radius:10px; overflow:hidden; position:relative; }
+#graph .hint { position:absolute; bottom:14px; left:50%; transform:translateX(-50%); font-size:12px; color:var(--t-tertiary); pointer-events:none; z-index:10; letter-spacing:0.03em; }
+.metrics { display:flex; gap:32px; flex-wrap:wrap; margin-top:24px; justify-content:center; }
+.metrics .m { text-align:center; }
+.metrics .m .val { font-size:34px; font-weight:800; color:var(--t-primary); letter-spacing:-0.03em; }
+.metrics .m .lbl { font-size:11px; color:var(--t-tertiary); margin-top:4px; text-transform:uppercase; letter-spacing:0.06em; font-weight:500; }
+.metrics .m .val.ca { color:var(--accent); }
+
+/* ─── Tabs / Quick Start ─── */
+.tabs-wrap { background:var(--bg-card); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.tabs { display:flex; border-bottom:1px solid var(--border); }
+.tab {
+  padding:14px 24px; font-size:13px; font-weight:600; cursor:pointer;
+  color:var(--t-tertiary); background:none; border:none; font-family:inherit;
+  transition:color 0.15s; letter-spacing:-0.01em; position:relative;
+}
+.tab:hover { color:var(--t-primary); }
+.tab.active { color:var(--accent); }
+.tab.active::after {
+  content:''; position:absolute; bottom:-1px; left:16px; right:16px;
+  height:2px; background:var(--accent); border-radius:1px 1px 0 0;
+}
+.tab-content { display:none; padding:28px 32px 32px; }
+.tab-content.active { display:block; }
+
+/* ─── Steps ─── */
+.steps { list-style:none; counter-reset:step; }
+.steps li { counter-increment:step; padding:14px 0 14px 48px; position:relative; border-bottom:1px solid var(--border); }
+.steps li:last-child { border-bottom:none; padding-bottom:0; }
+.steps li::before {
+  content:counter(step); position:absolute; left:0; top:12px;
+  width:28px; height:28px; border-radius:6px;
+  background:var(--accent-m); border:1px solid rgba(255,140,0,0.15);
+  display:flex; align-items:center; justify-content:center;
+  font-size:13px; font-weight:700; color:var(--accent);
+}
+.steps li strong { color:var(--t-primary); font-size:14px; letter-spacing:-0.01em; }
+.steps li p { color:var(--t-secondary); margin-top:6px; font-size:14px; line-height:1.65; }
+.steps li code { background:var(--bg-code); padding:1px 6px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--accent); border:1px solid var(--border); }
+
+/* ─── Code block ─── */
+.code-block {
+  background:var(--bg-code); border:1px solid var(--border); border-radius:8px;
+  padding:22px 28px; overflow-x:auto; position:relative;
+  font-family:'JetBrains Mono','Fira Code',monospace; font-size:13px; line-height:1.75;
+  color:#b0b0c8;
+}
+.code-block .c { color:var(--t-tertiary); }     /* comment */
+.code-block .k { color:var(--accent); }          /* keyword / command */
+.code-block .f { color:#e8b860; }                /* flag */
+.code-block .s { color:#6dab8c; }                /* string / path */
+.copy-btn {
+  position:absolute; top:10px; right:16px;
+  background:var(--bg-card); border:1px solid var(--border);
+  color:var(--t-secondary); padding:3px 10px; border-radius:5px; font-size:11px;
+  cursor:pointer; transition:all 0.15s; font-family:inherit; font-weight:500;
+}
+.copy-btn:hover { border-color:#555; color:var(--t-primary); }
+.copy-btn.done { background:var(--accent); color:#000; border-color:var(--accent); }
+
+/* ─── CTA ─── */
+.cta {
+  text-align:center; padding: 100px 40px;
+  background:
+    radial-gradient(ellipse 50% 50% at 50% 0%, rgba(255,140,0,0.06) 0%, transparent 60%);
+  border-top:1px solid var(--border);
+}
+.cta h2 { font-size:32px; font-weight:800; color:var(--t-primary); margin-bottom:10px; letter-spacing:-0.03em; }
+.cta p { color:var(--t-secondary); font-size:15px; margin-bottom:30px; }
+.cta .hero-btns { justify-content:center; }
+
+/* ─── Footer ─── */
+.footer {
+  border-top:1px solid var(--border); padding:36px 40px;
+  display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:20px; color:var(--t-tertiary); font-size:13px;
+}
+.footer a { color:var(--t-tertiary); }
+.footer a:hover { color:var(--t-primary); }
+.footer .fl { display:flex; gap:22px; }
+
+/* ─── Tooltip ─── */
+.tt {
+  background:#161622; color:#d0d0d8; padding:12px 16px; border-radius:8px;
+  font-family:system-ui,sans-serif; min-width:180px;
+  box-shadow:0 8px 32px rgba(0,0,0,0.5); border:1px solid #2a2a3a;
+  pointer-events:none; z-index:100; font-size:13px; display:none;
+}
+.tt .tt-t { font-size:14px; font-weight:700; color:#fff; margin-bottom:8px; }
+.tt .tt-r { display:flex; justify-content:space-between; padding:1px 0; }
+.tt .tt-l { color:var(--t-tertiary); }
+.tt .tt-v { color:#fff; font-weight:600; }
+
+/* ─── Responsive ─── */
+@media (max-width:768px) {
+  .nav { padding:0 20px; }
+  .nav-r { display:none; }
+  .hero { padding:100px 16px 60px; }
+  .sec { padding:60px 16px; }
+  .grid-3 { grid-template-columns:1fr; }
+  #graph { height:380px; }
+  .hero h1 { font-size:32px; }
+  .code-block { padding:16px; font-size:12px; }
+}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <a href="#" class="nav-brand">
+    <span class="marker"></span>
+    Topology Mapper
+    <span class="vers">v1.0</span>
+  </a>
+  <div class="nav-r">
+    <a href="#features">Features</a>
+    <a href="#graph">Demo</a>
+    <a href="#quickstart">Quick Start</a>
+    <a href="https://github.com" target="_blank" rel="noopener" class="btn btn-ghost">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="pill"><span class="dot"></span> Open Source SRE Tooling</div>
+  <h1>Map your services.<br>Find what&rsquo;s <em>broken</em>.</h1>
+  <p>Service Topology Manager fetches distributed traces from Jaeger, renders an interactive call graph, flags anomalous services, and produces per-edge lag windows for causal analysis.</p>
+  <div class="hero-btns">
+    <a href="#quickstart" class="btn btn-p">Get Started</a>
+    <a href="https://github.com" target="_blank" rel="noopener" class="btn btn-s">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+      Star on GitHub
+    </a>
+  </div>
+</section>
+
+<section id="features" class="sec">
+  <div class="sec-label">Capabilities</div>
+  <h2>Everything you need to understand service topology.</h2>
+  <p class="sub">Built for SRE teams that need to answer &ldquo;what talks to what?&rdquo; in seconds, not hours.</p>
+
+  <div class="grid-3">
+    <div class="card">
+      <div class="icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4m-8-10h4m12 0h4M6.3 6.3l2.8 2.8m5.7 5.7 2.8 2.8M6.3 17.7l2.8-2.8m5.7-5.7 2.8-2.8"/></svg>
+      </div>
+      <h3>Directed dependency graph</h3>
+      <p>Automatically builds a weighted directed call graph from Jaeger traces. Every edge carries call count and full latency distribution — average, P50, P95, P99.</p>
+    </div>
+    <div class="card">
+      <div class="icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      </div>
+      <h3>Anomaly detection</h3>
+      <p>Per-service P95 baseline with 2&times; threshold. Services exceeding the line are flagged as degraded or critical &mdash; clearly visible at a glance.</p>
+    </div>
+    <div class="card">
+      <div class="icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+      </div>
+      <h3>Interactive visualisation</h3>
+      <p>Click any node to inspect metrics in a slide-out panel. Click any edge to see the latency distribution. Drag nodes, scroll to zoom, hit <code>Ctrl+F</code> to search.</p>
+    </div>
+    <div class="card">
+      <div class="icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      </div>
+      <h3>Per-edge lag windows</h3>
+      <p>P99 span duration &times; 10 safety multiplier, clamped between 1 and 30 minutes. Synchronous RPCs resolve to 1-minute windows. Asynchronous queue edges produce 20+ minute windows. Direct input for cross-correlation causal analysis.</p>
+    </div>
+    <div class="card">
+      <div class="icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </div>
+      <h3>Multiple export formats</h3>
+      <p>Export the graph as JSON in node-link format, as DOT for graphviz, or as static images in PNG and SVG. Drop the output directly into downstream tools or dashboards.</p>
+    </div>
+    <div class="card">
+      <div class="icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/><line x1="11" y1="8" x2="11" y2="14"/></svg>
+      </div>
+      <h3>Neighbourhood zoom</h3>
+      <p>Filter the graph with <code>--service cartservice --hops 2</code> to show only the services within N steps of your target. Indispensable when you have a hundred microservices.</p>
+    </div>
+  </div>
+</section>
+
+<section id="graph" class="graph-wrap">
+  <div class="sec">
+    <div class="sec-label">Live Demo</div>
+    <h2>Interactive dependency graph</h2>
+    <p class="sub">Output of the tool on 300 distributed traces across 11 services. Click any node.</p>
+
+    <div id="graph">
+      <div class="search-box">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="search-input" placeholder="Search services..." autocomplete="off">
+      </div>
+      <div class="hint">CLICK a node for details &bull; DRAG to rearrange &bull; Ctrl+F to search</div>
+    </div>
+
+    <div class="metrics">
+      <div class="m"><div class="val ca">11</div><div class="lbl">Services</div></div>
+      <div class="m"><div class="val" style="color:#e8b860;">11</div><div class="lbl">Edges</div></div>
+      <div class="m"><div class="val">300</div><div class="lbl">Traces</div></div>
+      <div class="m"><div class="val" style="color:#6dad8c;">0.03</div><div class="lbl">Anomaly score</div></div>
+    </div>
+  </div>
+</section>
+
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-hd">
+    <h2 id="sb-title">Service Details</h2>
+    <button class="sidebar-close" onclick="document.getElementById('sidebar').classList.remove('open');network.selectNodes([])">&times;</button>
+  </div>
+  <div class="sidebar-body" id="sb-body"></div>
+</div>
+
+<section id="quickstart" class="sec">
+  <div class="sec-label">Quick Start</div>
+  <h2>Thirty seconds to your first topology map.</h2>
+  <p class="sub">No Docker. No Kubernetes. Just Python 3.9+.</p>
+
+  <div class="tabs-wrap">
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('demo',this)">One-Command Demo</button>
+      <button class="tab" onclick="switchTab('manual',this)">Manual Setup</button>
+      <button class="tab" onclick="switchTab('jaeger',this)">With Your Jaeger</button>
+    </div>
+
+    <div id="tab-demo" class="tab-content active">
+      <ul class="steps">
+        <li>
+          <strong>Clone and install</strong>
+          <p><code>git clone https://github.com/user/service-topology-manager.git</code><br><code>pip install -e .</code></p>
+        </li>
+        <li><strong>Run the demo</strong><p><code>bash demo.sh</code></p></li>
+        <li><strong>Browser opens</strong> with your interactive topology map</li>
+      </ul>
+    </div>
+
+    <div id="tab-manual" class="tab-content">
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this,'manual-code')">Copy</button>
+        <code id="manual-code">
+<span class="c"># Install the tool</span>
+<span class="k">pip install -e .</span>
+
+<span class="c"># Generate 300 sample traces (11 services, injected anomalies)</span>
+<span class="k">python3</span> <span class="s">generate_sample_traces.py</span>
+
+<span class="c"># Build and view</span>
+<span class="k">topology-map render</span> <span class="f">--from-file</span> <span class="s">sample_traces.json</span> <span class="f">--highlight-anomalies</span>
+<span class="k">open</span> <span class="s">topology.html</span>
+        </code>
+      </div>
+    </div>
+
+    <div id="tab-jaeger" class="tab-content">
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this,'jaeger-code')">Copy</button>
+        <code id="jaeger-code">
+<span class="c"># Point at your Jaeger instance</span>
+<span class="k">topology-map render</span> \
+  <span class="f">--jaeger-url</span> <span class="s">http://localhost:16686</span> \
+  <span class="f">--lookback</span> 1h \
+  <span class="f">--highlight-anomalies</span>
+
+<span class="c"># Export for downstream analysis</span>
+<span class="k">topology-map export</span> <span class="f">--format</span> json <span class="f">--output</span> <span class="s">graph.json</span>
+<span class="k">topology-map lag-windows</span> <span class="f">--output</span> <span class="s">lag_windows.json</span>
+        </code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="cta">
+  <h2>Ready to map your services?</h2>
+  <p>Open source. MIT licensed. Works with any Jaeger instance.</p>
+  <div class="hero-btns">
+    <a href="https://github.com" target="_blank" rel="noopener" class="btn btn-p">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+      View on GitHub
+    </a>
+    <a href="#graph" class="btn btn-s">Try the demo</a>
+  </div>
+</section>
+
+<footer class="footer">
+  <span>Built for SRE teams</span>
+  <div class="fl">
+    <a href="https://github.com" target="_blank" rel="noopener">GitHub</a>
+    <a href="#features">Features</a>
+    <a href="#quickstart">Quick Start</a>
+  </div>
+</footer>
+
+<script>
+function switchTab(name, el) {
+  var tabs = document.querySelectorAll('.tab');
+  var contents = document.querySelectorAll('.tab-content');
+  tabs.forEach(function(t){t.classList.remove('active');});
+  contents.forEach(function(c){c.classList.remove('active');});
+  el.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+}
+
+function copyCode(btn, id) {
+  var code = document.getElementById(id).textContent.trim();
+  navigator.clipboard.writeText(code).then(function() {
+    btn.textContent = 'Copied';
+    btn.classList.add('done');
+    setTimeout(function(){ btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1800);
+  });
+}
+
+// ─── Graph ───
+var rawEdges = [
+  {f:'frontend',t:'productcatalogservice',w:184,a:29.9,p:53.3,min:10.7,max:57.6},
+  {f:'productcatalogservice',t:'adservice',w:184,a:20.4,p:33.1,min:5.8,max:39.0},
+  {f:'frontend',t:'cartservice',w:236,a:99.0,p:753.7,min:11.6,max:1013.9},
+  {f:'cartservice',t:'redis-cart',w:172,a:5.1,p:8.4,min:0.4,max:9.1},
+  {f:'frontend',t:'checkoutservice',w:89,a:62.2,p:109.2,min:16.4,max:115.1},
+  {f:'checkoutservice',t:'shippingservice',w:89,a:82.2,p:130.9,min:33.5,max:137.3},
+  {f:'shippingservice',t:'emailservice',w:89,a:119878,p:143416,min:60000,max:180000},
+  {f:'checkoutservice',t:'paymentservice',w:61,a:122.3,p:211.0,min:32.6,max:225.7},
+  {f:'checkoutservice',t:'emailservice',w:46,a:206.2,p:297.1,min:79.8,max:300.2},
+  {f:'checkoutservice',t:'currencyservice',w:26,a:47.7,p:77.5,min:22.0,max:78.8},
+  {f:'frontend',t:'recommendationservice',w:124,a:24.6,p:43.6,min:9.9,max:46.8}
+];
+
+var nodeMap = {};
+rawEdges.forEach(function(e){
+  if(!nodeMap[e.f]) nodeMap[e.f]={id:e.f,pre:[],suc:[],eIn:[],eOut:[]};
+  if(!nodeMap[e.t]) nodeMap[e.t]={id:e.t,pre:[],suc:[],eIn:[],eOut:[]};
+  nodeMap[e.f].suc.push(e.t); nodeMap[e.f].eOut.push(e);
+  nodeMap[e.t].pre.push(e.f); nodeMap[e.t].eIn.push(e);
+});
+
+Object.values(nodeMap).forEach(function(n){
+  n.degree = n.pre.length + n.suc.length;
+  n.inD = n.pre.length; n.outD = n.suc.length;
+  var ins = []; n.eIn.forEach(function(e){ins.push(e.p);});
+  var outs = []; n.eOut.forEach(function(e){outs.push(e.p);});
+  n.p95In = ins.length ? Math.round(ins.reduce(function(a,b){return Math.max(a,b)})*10)/10 : null;
+  n.p95Out = outs.length ? Math.round(outs.reduce(function(a,b){return Math.max(a,b)})*10)/10 : null;
+});
+
+var completeNodes = Object.values(nodeMap).map(function(n){
+  return {id:n.id,pre:n.pre,suc:n.suc,degree:n.degree,inD:n.inD,outD:n.outD,
+    p95In:n.p95In,p95Out:n.p95Out};
+});
+
+var nodes = new vis.DataSet(completeNodes.map(function(n){
+  return {id:n.id,label:n.id,pre:n.pre,suc:n.suc,degree:n.degree,
+    inD:n.inD,outD:n.outD,p95In:n.p95In,p95Out:n.p95Out};
+}));
+
+var maxD = 0; Object.values(nodeMap).forEach(function(n){if(n.degree>maxD)maxD=n.degree;});
+var maxW = 0; rawEdges.forEach(function(e){if(e.w>maxW)maxW=e.w;});
+
+nodes.forEach(function(n){
+  var nd = nodeMap[n.id];
+  var sz = 18 + (nd.degree/maxD)*38;
+  nodes.update({id:n.id,size:sz,
+    color:{background:'#ff8c00',border:'#cc7000',highlight:{background:'#ffa040',border:'#ffd700'}},
+    font:{color:'#ffd700',face:'Inter,system-ui',size:11,strokeWidth:0},
+    shadow:{enabled:true,color:'rgba(255,140,0,0.22)',size:8,x:0,y:0},
+    shape:'dot',borderWidth:2,mass:2
+  });
+});
+
+var edges = new vis.DataSet(rawEdges.map(function(e,i){
+  var w = 1+(e.w/maxW)*3.5;
+  var o = 0.25+(e.w/maxW)*0.3;
+  var lagMin = e.p ? Math.max(1,Math.min(30,Math.round((e.p/1000/60)*10*10)/10)) : null;
+  return {id:i,from:e.f,to:e.t,value:e.w,width:w,
+    weight:e.w,avg:e.a,p99:e.p,min:e.min,max:e.max,lagMin:lagMin,
+    color:{color:'rgba(255,140,0,'+o+')',highlight:'#ffd700',hover:'#ff8c00'},
+    smooth:{type:'curvedCW',roundness:0.15},
+    arrows:{to:{enabled:true,scaleFactor:0.55}},
+    title:'<div style="background:#161622;color:#d0d0d8;padding:12px 16px;border-radius:8px;font-family:system-ui;min-width:200px;box-shadow:0 8px 28px rgba(0,0,0,0.45);border:1px solid #2a2a3a;font-size:13px;"><b style="color:#fff;font-size:14px;">'+e.f+' &rarr; '+e.t+'</b><br><br><span style="color:#5c5c70;">Calls</span>  <b style="color:#fff;">'+e.w+'</b><br><span style="color:#5c5c70;">Avg</span>  <b style="color:#fff;">'+e.a+' ms</b><br><span style="color:#5c5c70;">P99</span>  <b style="color:#fff;">'+e.p+' ms</b></div>'
+  };
+}));
+
+var network = new vis.Network(document.getElementById('graph'), {nodes:nodes,edges:edges}, {
+  autoResize:true,
+  physics:{barnesHut:{gravitationalConstant:-3000,centralGravity:0.25,springLength:170,springConstant:0.03,damping:0.12,avoidOverlap:0.3},minVelocity:0.75,solver:'barnesHut',stabilization:{iterations:300,updateInterval:20}},
+  interaction:{hover:true,hoverConnectedEdges:true,navigationButtons:true,keyboard:{enabled:false},zoomView:true,dragView:true},
+  layout:{improvedLayout:true}
+});
+
+// ─── Sidebar ───
+function fmt(ms){
+  if(ms==null)return'--';if(ms>=1000)return(ms/1000).toFixed(1)+'s';return ms.toFixed(1)+'ms';
+}
+function openNodeSidebar(nd){
+  var s=document.getElementById('sidebar');var t=document.getElementById('sb-title');
+  var b=document.getElementById('sb-body');
+  t.textContent=nd.id;
+  var preHTML=''; if(nd.pre.length) nd.pre.forEach(function(p){preHTML+='<li onclick="focusNode(\''+p+'\')">'+p+'</li>';});
+  var sucHTML=''; if(nd.suc.length) nd.suc.forEach(function(s){sucHTML+='<li onclick="focusNode(\''+s+'\')">'+s+'</li>';});
+  b.innerHTML='<div class="sb-sec"><div class="sb-sec-t">Connections</div><div class="sb-row"><span class="l">Degree</span><span class="v">'+nd.degree+'</span></div><div class="sb-row"><span class="l">In / Out</span><span class="v">'+nd.inD+' / '+nd.outD+'</span></div></div>'+
+    '<div class="sb-sec"><div class="sb-sec-t">Latency Profile</div><div class="sb-row"><span class="l">P95 Inbound</span><span class="v">'+fmt(nd.p95In)+'</span></div><div class="sb-row"><span class="l">P95 Outbound</span><span class="v">'+fmt(nd.p95Out)+'</span></div></div>'+
+    '<div class="sb-sec"><div class="sb-sec-t">Called By</div><ul class="sb-chips">'+(preHTML||'<li style="color:var(--t-tertiary);cursor:default;">none</li>')+'</ul></div>'+
+    '<div class="sb-sec"><div class="sb-sec-t">Calls To</div><ul class="sb-chips">'+(sucHTML||'<li style="color:var(--t-tertiary);cursor:default;">none</li>')+'</ul></div>';
+  s.classList.add('open');
+}
+function openEdgeSidebar(ed){
+  var s=document.getElementById('sidebar');var t=document.getElementById('sb-title');
+  var b=document.getElementById('sb-body');
+  t.textContent=ed.from+' \u2192 '+ed.to;
+  b.innerHTML='<div class="sb-sec"><div class="sb-sec-t">Traffic</div><div class="sb-row"><span class="l">Calls</span><span class="v">'+ed.weight+'</span></div></div>'+
+    '<div class="sb-sec"><div class="sb-sec-t">Latency</div><div class="sb-row"><span class="l">Avg</span><span class="v">'+fmt(ed.avg)+'</span></div><div class="sb-row"><span class="l">P99</span><span class="v">'+fmt(ed.p99)+'</span></div><div class="sb-row"><span class="l">Min</span><span class="v">'+fmt(ed.min)+'</span></div><div class="sb-row"><span class="l">Max</span><span class="v">'+fmt(ed.max)+'</span></div></div>'+
+    '<div class="sb-sec"><div class="sb-sec-t">Causal Window</div><div class="sb-row"><span class="l">Lag</span><span class="v">'+(ed.lagMin?ed.lagMin+' min':'--')+'</span></div></div>';
+  s.classList.add('open');
+}
+function focusNode(id){
+  network.selectNodes([id]);
+  network.focus(id,{scale:1.25,animation:{duration:400,easingFunction:'easeInOutQuad'}});
+  var nd = nodeMap[id]; if(nd) openNodeSidebar(nd);
+}
+
+network.on('selectNode',function(p){
+  var nd=nodeMap[p.nodes[0]]; if(nd) openNodeSidebar(nd);
+});
+network.on('deselectNode',function(){
+  document.getElementById('sidebar').classList.remove('open');
+});
+network.on('selectEdge',function(p){
+  var ed=edges.get(p.edges[0]); if(ed) openEdgeSidebar(ed);
+});
+network.on('deselectEdge',function(){
+  document.getElementById('sidebar').classList.remove('open');
+});
+network.on('doubleClick',function(p){
+  if(p.nodes.length===0) network.fit({animation:{duration:600,easingFunction:'easeInOutQuad'}});
+});
+network.on('stabilizationIterationsDone',function(){
+  this.setOptions({physics:{stabilization:false}});
+  this.fit({animation:{duration:1000,easingFunction:'easeInOutQuad'}});
+});
+
+// ─── Search ───
+var searchEl = document.getElementById('search-input');
+var searchTimer;
+searchEl.addEventListener('input',function(){
+  clearTimeout(searchTimer);
+  var q=this.value.toLowerCase().trim();
+  searchTimer=setTimeout(function(){
+    if(!q){network.selectNodes([]);return;}
+    var all=nodes.get();
+    var m=all.filter(function(n){return n.label.toLowerCase().indexOf(q)!==-1;});
+    if(m.length){focusNode(m[0].id);}
+  },200);
+});
+searchEl.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){this.value='';network.selectNodes([]);document.getElementById('sidebar').classList.remove('open');network.fit({animation:true});}
+});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){document.getElementById('sidebar').classList.remove('open');network.selectNodes([]);}
+  if((e.ctrlKey||e.metaKey)&&e.key==='f'){e.preventDefault();searchEl.focus();}
+  if((e.ctrlKey||e.metaKey)&&e.key==='0'){e.preventDefault();network.fit({animation:{duration:600,easingFunction:'easeInOutQuad'}});}
+});
+</script>
+</body>
+</html>
