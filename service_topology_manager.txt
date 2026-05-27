@@ -1,0 +1,429 @@
+# Project 1: Service Topology Mapper — Build Reference
+
+> This document is the canonical reference for building a trace-based service dependency graph visualizer. It is a standalone, shippable project that contributes to Phase 1a of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help. This project replaces and enhances subproject #2 (Trace Graph Visualizer).
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building a tool that fetches traces from Jaeger and renders the service dependency graph as a visual diagram. Think of it like a map-maker — you're taking raw trace data (who called whom, when, how often, how long it took) and turning it into a picture that shows the actual call relationships between services. This is the first thing any developer wants to see when they inherit a microservice system: "what talks to what?" It also produces per-edge lag windows — the P99 call durations that feed directly into causal analysis in Project 5.
+
+## Tool Objective
+
+By the end of this project, the tool must:
+1. Connect to a running Jaeger instance and fetch traces
+2. Parse traces to extract service-to-service call relationships
+3. Build a directed, weighted graph showing call frequency AND latency distributions
+4. Highlight anomalous services (spans exceeding 2× per-service P95 baseline)
+5. Render the graph visually (interactive HTML via pyvis or static image via graphviz)
+6. Allow filtering by service, time window, and operation name
+7. Export the graph as JSON and DOT format
+8. Export per-edge lag windows (P99 span duration × 10 safety factor) for causal analysis
+
+## What You Must Understand Before Coding
+
+### Concept 1: Jaeger API Trace Structure
+
+The Jaeger API returns traces as JSON with a specific structure. Each trace contains:
+- `traceID`: unique identifier for the entire request
+- `spans`: array of span objects, each with:
+  - `spanID`: unique identifier for this span
+  - `parentSpanID`: the span that called this one (empty string or "0" if root)
+  - `operationName`: what method was called
+  - `startTime`: microseconds since epoch
+  - `duration`: microseconds
+  - `processID`: references the `processes` map
+  - `flags`: bit field (1 = sampled)
+  - `tags`: key-value pairs (errors are `{key: "error", value: true}`)
+- `processes`: map of processID → `{serviceName, tags}`
+
+**Why this matters:** To build the dependency graph, you need to match each span to its parent span, then extract the service names from the `processes` map. The edge is `parent.serviceName → child.serviceName`. If you don't understand the `processes` map, you'll extract wrong service names.
+
+**Self-check:** Given a span with `processID: "p1"` and `parentSpanID: "abc123"`, how do you find the parent's service name? Answer: Find the span with `spanID: "abc123"` in the same trace's `spans` array, get its `processID`, then look up that processID in the `processes` map — that's the parent's `serviceName`.
+
+### Concept 2: Directed Graphs and Edge Attributes
+
+A directed graph (DiGraph) has nodes and directed edges. In your case:
+- Nodes = service names
+- Edges = "A calls B" (directed from caller to callee)
+- Edge weight = how many times this call was observed
+- Edge attribute `durations`: list of all observed span durations for this edge (needed for P99 and lag windows)
+
+NetworkX is the Python library for this. `nx.DiGraph()` creates a directed graph. `G.add_edge("A", "B", weight=5, durations=[...])` adds an edge with attributes.
+
+**Why this matters:** Edge weights determine line thickness in the visualization. Duration lists are the input to per-edge lag window computation — which directly feeds Project 5's causal analysis. Without storing raw durations per edge, you can't compute P99 latency windows.
+
+**Self-check:** If service A calls B 50 times and B calls C 30 times, and A calls C 20 times, what does the graph look like? Answer: Three nodes (A, B, C). Three edges: A→B (weight=50), B→C (weight=30), A→C (weight=20). A has out-degree 2, C has in-degree 2.
+
+### Concept 3: Per-Edge Lag Windows from Trace Data
+
+For causal analysis (Project 5), you need to know how long an edge *typically* takes — the P99 span duration. This is used to set the cross-correlation search window when determining whether an upstream anomaly actually caused a downstream anomaly.
+
+**The formula:**
+```
+lag_window(minutes) = max(1.0, min(30.0, (P99_duration_ms / 1000 / 60) * 10))
+```
+
+- Synchronous edges (fast RPCs, ~200ms P99) → ~1 minute lag window
+- Async edges (via queue, ~120s P99) → ~20 minute lag window
+- Minimum 1 minute, maximum 30 minutes
+- The `× 10` multiplier is a safety margin — during incidents, failures cause 10× normal latency
+
+**Why this matters:** A fixed 10-minute window would miss async edges (messages in queues for 20+ minutes) AND produce false positives on sync edges (overly wide windows pick up spurious correlations). Per-edge windows are the foundation of accurate causal analysis.
+
+**Self-check:** If `frontend → cart-service` has P99 = 200ms, what's the lag window? Answer: `max(1, min(30, (200/1000/60) * 10))` = `max(1, min(30, 0.0333))` = 1 minute (clamped to minimum). If `cart-service → email-service` (async) has P99 = 120s, window = `max(1, min(30, 2 * 10))` = 20 minutes.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| Jaeger HTTP API | [Jaeger API docs](https://www.jaegertracing.io/docs/latest/api/) | `GET /api/traces` endpoint: parameters (`service`, `lookback`, `start`, `end`), response format, pagination. Timestamps are in MICROSECONDS. |
+| NetworkX DiGraph | [NetworkX docs](https://networkx.org/documentation/stable/reference/classes/digraph.html) | Creating directed graphs, adding weighted edges, storing list attributes on edges, querying node/edge properties. |
+| pyvis | [pyvis docs](https://pyvis.readthedocs.io/) | Interactive HTML graph rendering with drag-and-drop nodes. `Network(directed=True)`, `.add_node()`, `.add_edge()`, `.show()`. |
+| graphviz | [graphviz Python](https://graphviz.readthedocs.io/) | Static image rendering. `Digraph()`, `.node()`, `.edge()`, `.render()`. Good for embedding in documents. |
+| Python dataclasses | [dataclass docs](https://docs.python.org/3/library/dataclasses.html) | For Span and Trace data models. |
+
+## What to Code
+
+### Component 1.1: Jaeger Trace Fetcher
+
+**Purpose:** Fetch traces from Jaeger API and return structured data.
+
+**Input:** Service name (optional), time window (lookback or start/end timestamps)
+**Output:** List of parsed `Trace` objects
+
+**What to understand when coding this:**
+
+The Jaeger API endpoint:
+`GET http://<jaeger-url>/api/traces?service=<service>&lookback=1h&limit=100`
+
+- `lookback` format: `1h`, `30m`, `15m`
+- `start` and `end` are Unix timestamps in **microseconds** (16 digits!). This is the #1 source of bugs.
+- If no service is specified, fetches all traces (can be enormous — use judiciously)
+- Response is paginated — JSON contains `total` and `limit` fields. If `total > limit`, iterate.
+- Rate-limit: add a small delay (100ms) between requests to avoid overwhelming Jaeger
+
+Parse the response into Python dataclasses:
+```python
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class Span:
+    trace_id: str
+    span_id: str
+    parent_id: Optional[str]  # None or "" means root span
+    service_name: str
+    operation_name: str
+    start_time_micros: int
+    duration_micros: int
+    is_error: bool
+    tags: dict = field(default_factory=dict)
+
+    @property
+    def duration_ms(self) -> float:
+        return self.duration_micros / 1000.0
+
+@dataclass
+class Trace:
+    trace_id: str
+    spans: list[Span]
+    root_service: Optional[str] = None
+```
+
+**Edge cases to handle:**
+- `parentSpanID` of `"0"` or `""` → both mean root span. Normalize to `None`.
+- Some traces have only 1 span (health checks). Filter them out if `len(spans) == 1`.
+- A span's parent might be in a different trace (rare in sampled data). Skip these edges gracefully.
+- Timestamps are in MICROSECONDS. Divide by 1,000,000 for epoch seconds, not 1,000.
+
+**How to verify it works:**
+- Fetch traces for `frontend` service with `lookback=1h`
+- Print the first trace's span count and service names
+- Manually verify the same trace exists in Jaeger UI by searching the traceID
+- Count: do you get approximately the same number of traces from the API as shown in the UI?
+
+### Component 1.2: Dependency Graph Builder
+
+**Purpose:** Build a directed, weighted graph from traces with per-edge duration distributions.
+
+**Input:** List of `Trace` objects
+**Output:** NetworkX `DiGraph` with weighted edges and `durations` attribute
+
+**What to understand when coding this:**
+
+For each trace:
+1. Build a `dict[span_id, Span]` for quick parent lookup
+2. For each non-root span (where `parent_id` is not None):
+   - Find the parent span in the dict
+   - Edge = `parent.service_name → child.service_name`
+   - Increment edge weight by 1
+   - Append `child.duration_ms` to edge's `durations` list
+
+```python
+import networkx as nx
+from collections import defaultdict
+
+def build_graph(traces: list[Trace]) -> nx.DiGraph:
+    G = nx.DiGraph()
+    edge_durations: dict[tuple[str, str], list[float]] = defaultdict(list)
+
+    for trace in traces:
+        span_map = {s.span_id: s for s in trace.spans}
+        for span in trace.spans:
+            if span.parent_id and span.parent_id in span_map:
+                parent = span_map[span.parent_id]
+                edge = (parent.service_name, span.service_name)
+                edge_durations[edge].append(span.duration_ms)
+
+    for (u, v), durations in edge_durations.items():
+        G.add_edge(u, v, weight=len(durations), durations=durations)
+
+    return G
+```
+
+**After processing all traces:**
+- Nodes are unique service names
+- Edges have `weight` (call count) and `durations` (list of all ms values for P99 computation)
+- Optionally compute `avg_duration_ms`, `p50_duration_ms`, `p95_duration_ms`, `p99_duration_ms` as edge attributes
+
+**How to verify it works:**
+- Build the graph from 1000 traces of Online Boutique
+- `print(G.nodes())` → should be ~11 services
+- `print(list(G.edges(data=True))[0])` → should show weight and durations
+- Frontend should have highest out-degree. Database should have highest in-degree.
+- Compare against the known Online Boutique architecture diagram
+
+### Component 1.3: Anomaly Highlighter
+
+**Purpose:** Flag services whose span durations are anomalous relative to their per-service baseline.
+
+**Input:** List of `Trace` objects, dependency graph
+**Output:** Dictionary mapping `service_name → {anomaly_score, status}`
+
+**What to understand when coding this:**
+
+1. For each service, collect all span durations across all traces from the graph's edge data
+2. Compute P95 latency per service as baseline
+3. For each service, count how many of its spans exceed `2 × P95`
+4. Compute anomaly score as: `anomalous_spans / total_spans`
+5. Map score to status:
+   - `score < 0.05` → "healthy" (green)
+   - `0.05 ≤ score < 0.15` → "degraded" (yellow)
+   - `score ≥ 0.15` → "critical" (red)
+
+**Why this matters:** The graph visualization becomes actionable when you can see at-a-glance which services are degraded. The anomaly scores here also form the initial signal that Project 2 uses for spectrum scoring.
+
+**How to verify it works:**
+- Run on normal data → all services should show "healthy"
+- Inject latency into `cart-service` → that service should show "critical"
+- After cleanup and 10 minutes → should return to "healthy"
+
+### Component 1.4: Per-Edge Lag Window Computer
+
+**Purpose:** Compute per-edge maximum correlation lag windows from trace duration data.
+
+**Input:** NetworkX `DiGraph` with `durations` attribute on edges
+**Output:** Dictionary mapping `(source, target) → max_lag_minutes`
+
+**What to understand when coding this:**
+
+```python
+import numpy as np
+
+def compute_lag_windows(graph: nx.DiGraph) -> dict[tuple[str, str], float]:
+    """
+    For each edge, compute P99 span duration and convert to lag window.
+    The ×10 safety multiplier accounts for incident-time latency inflation.
+    """
+    windows = {}
+    for u, v, data in graph.edges(data=True):
+        durations = data.get('durations', [])
+        if not durations:
+            windows[(u, v)] = 10.0  # fallback: 10 minutes
+            continue
+
+        p99 = np.percentile(durations, 99)
+        # Convert ms → minutes, apply safety multiplier, clamp to [1, 30]
+        lag_minutes = max(1.0, min(30.0, (p99 / 1000 / 60) * 10))
+        windows[(u, v)] = lag_minutes
+
+    return windows
+```
+
+**Why the safety multiplier matters:** During an incident, latencies can spike 5-10× normal. If the normal P99 is 200ms (→ 1 min window), the incident-time correlation might show up at a 5-minute lag. The ×10 multiplier ensures the window is wide enough to catch propagation effects even under load.
+
+**How to verify it works:**
+- Sync edges (frontend→cart-service, ~200ms P99) → should have ~1 minute windows
+- Async edges (cart-service→email-service, ~120s P99) → should have 15-30 minute windows
+- Export to JSON: `lag_windows.json`. Verify it can be consumed by Project 5.
+
+### Component 1.5: Graph Renderer
+
+**Purpose:** Visualize the dependency graph with health status coloring and edge weight display.
+
+**Input:** NetworkX `DiGraph`, anomaly scores per service
+**Output:** Interactive HTML (pyvis) or static image (graphviz)
+
+**What to understand when coding this:**
+
+**Option A: pyvis (interactive HTML, recommended default)**
+```python
+from pyvis.network import Network
+
+def render_interactive(G: nx.DiGraph, anomalies: dict[str, dict]) -> str:
+    STATUS_COLORS = {"healthy": "#4CAF50", "degraded": "#FFC107", "critical": "#F44336"}
+
+    net = Network(height="750px", width="100%", directed=True, bgcolor="#ffffff")
+    for node in G.nodes():
+        status = anomalies.get(node, {}).get("status", "healthy")
+        color = STATUS_COLORS.get(status, "#9E9E9E")
+        net.add_node(node, label=node, color=color,
+                     size=max(20, G.degree(node) * 8),
+                     title=f"degree: {G.degree(node)}")
+
+    for u, v, data in G.edges(data=True):
+        weight = data.get('weight', 1)
+        avg_ms = np.mean(data.get('durations', [0]))
+        net.add_edge(u, v, value=weight,
+                     title=f"calls: {weight}\navg: {avg_ms:.1f}ms")
+
+    net.show_buttons(filter_=['physics'])
+    net.save_graph("topology.html")
+    return "topology.html"
+```
+
+**Option B: graphviz (static image, for embedding in docs/reports)**
+```python
+import graphviz
+
+def render_static(G: nx.DiGraph, anomalies: dict[str, dict]) -> str:
+    STATUS_COLORS = {"healthy": "#4CAF50", "degraded": "#FFC107", "critical": "#F44336"}
+
+    dot = graphviz.Digraph(format="png", engine="dot")
+    dot.attr(rankdir="LR")
+    for node in G.nodes():
+        status = anomalies.get(node, {}).get("status", "healthy")
+        dot.node(node, style="filled", fillcolor=STATUS_COLORS.get(status, "#9E9E9E"))
+
+    for u, v, data in G.edges(data=True):
+        weight = data.get('weight', 1)
+        dot.edge(u, v, label=str(weight))
+
+    dot.render("topology", cleanup=True)
+    return "topology.png"
+```
+
+**How to verify it works:**
+- Render the graph on normal data → all nodes green
+- Inject latency into `cart-service` → cart-service turns red
+- Frontend should be on the left/center with edges flowing to downstream services
+- Edge labels/thickness should reflect call frequency
+
+### Component 1.6: CLI Interface
+
+**Purpose:** Command-line interface for fetching, building, rendering, and exporting.
+
+**Commands:**
+```bash
+# Fetch traces and render interactive HTML
+topology-map render --jaeger-url http://localhost:16686 --lookback 1h
+
+# Render with anomaly highlighting
+topology-map render --jaeger-url http://localhost:16686 --lookback 1h --highlight-anomalies
+
+# Filter to a specific service and its neighbors
+topology-map render --service cartservice --lookback 30m
+
+# Export dependency graph as JSON (for Project 2)
+topology-map export --jaeger-url http://localhost:16686 --format json --output graph.json
+
+# Export as DOT format
+topology-map export --format dot --output graph.dot
+
+# Export per-edge lag windows (for Project 5)
+topology-map lag-windows --jaeger-url http://localhost:16686 --output lag_windows.json
+
+# Render static image
+topology-map render --format png --output topology.png
+```
+
+Use `click` for CLI parsing. It's cleaner than argparse and auto-generates help.
+
+## How the Pieces Connect
+
+```
+Jaeger API
+    │
+    ▼
+┌─────────────────┐
+│ Trace Fetcher    │ ←── Fetches raw traces from Jaeger
+│ (Component 1.1)  │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Graph Builder    │ ←── Parses parent-child relationships
+│ (Component 1.2)  │     Builds DiGraph with weights + durations
+└────────┬────────┘
+         │
+    ┌────┴────────────┬──────────────┐
+    ▼                 ▼              ▼
+┌──────────────┐ ┌──────────┐ ┌──────────────┐
+│ Anomaly       │ │ Renderer │ │ Lag Window   │
+│ Highlighter   │ │ (1.5)    │ │ Computer     │
+│ (1.3)        │ │          │ │ (1.4)        │
+└──────┬───────┘ └────┬─────┘ └──────┬───────┘
+       │              │              │
+       ▼              ▼              ▼
+  anomaly.json    topology.html   lag_windows.json
+  (→ Project 2)   (standalone)    (→ Project 5)
+```
+
+## Understanding Checkpoints
+
+1. "Can I fetch traces from Jaeger and parse them into Span/Trace dataclasses?" — If no, the Jaeger API response format is different than expected. Check timestamp units (microseconds).
+2. "Does the rendered graph match the known Online Boutique architecture?" — If no, your parent-child span matching logic is wrong. Verify `parentSpanID` handling.
+3. "Can I filter the graph to show only the neighbors of a specific service?" — If no, add subgraph extraction from NetworkX.
+4. "Do per-edge lag windows correctly distinguish sync vs async edges?" — If no, check your P99 calculation and the `× 10` safety multiplier.
+5. "Do anomaly highlights appear correctly when I inject a fault?" — If no, check your `2 × P95` threshold and per-service baseline computation.
+
+## Common Mistakes
+
+1. **Not handling missing parent spans.** Some traces have spans whose parent is in a different trace (rare with sampling). Skip these edges, don't crash.
+2. **Using service name from span tags instead of the `processes` map.** The `processID` MUST be resolved through the `processes` map to get the actual service name.
+3. **Overwhelming the Jaeger API.** Fetching all traces for a long time window can return thousands. Use pagination and reasonable `limit` values. Add a small delay between paginated requests.
+4. **Confusing microseconds with milliseconds.** Jaeger returns `startTime` and `duration` in MICROSECONDS. Divide by 1,000 for ms, by 1,000,000 for seconds.
+5. **Not storing `durations` list on edges.** The per-edge lag window computer needs the raw duration values, not just aggregated stats. Store `durations: list[float]` as an edge attribute.
+6. **Filtering single-span traces too aggressively.** A trace with one span might be a valid request (e.g., a cache hit). Don't filter them all — just flag them as "simple" rather than discarding.
+
+## Ship Criteria
+
+- [ ] Fetches traces from Jaeger API with proper pagination
+- [ ] Builds accurate dependency graph with edge weights and `durations`
+- [ ] Renders interactive HTML visualization with health-status coloring
+- [ ] Renders static PNG via graphviz
+- [ ] Anomaly highlighting (2× P95 threshold) per service
+- [ ] Per-edge lag window computation and export (`lag-windows` command)
+- [ ] AI with `render`, `export`, and `lag-windows` commands
+- [ ] Filtering by service, time window, and operation name
+- [ ] JSON and DOT export
+- [ ] README with screenshots and setup instructions
+- [ ] Works with any Jaeger instance (not just Online Boutique)
+- [ ] Handles edge cases: missing parents, empty traces, pagination, single-span traces
